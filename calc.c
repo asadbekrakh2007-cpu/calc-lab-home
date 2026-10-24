@@ -1,4 +1,4 @@
-// Asadbek Rakhmatillaev 251ADB073
+// Asadbek Rakhmatillaev 251adb073
 // https://github.com/asadbekrakh2007-cpu/calc-lab-home
 // Compile with: gcc -O2 -Wall -Wextra -std=c17 -o calc calc.c -lm
 // Resources used: Claude (Anthropic AI assistant), conversation history: <PASTE SHARE LINK HERE>; C standard library man pages (fread, stat, mkdir)
@@ -25,7 +25,7 @@
 // A token only remembers its index in that buffer, so a position is just
 // "index + 1". Newlines are part of the buffer, so they are counted for free.
 // ---------------------------------------------------------------------------
-typedef enum { T_NUM, T_PLUS, T_MINUS, T_EOL, T_BAD } TokType;
+typedef enum { T_NUM, T_PLUS, T_MINUS, T_STAR, T_SLASH, T_EOL, T_BAD } TokType;
  
 typedef struct {
     TokType type;
@@ -66,31 +66,63 @@ static void advance(void) {
     g_p++;
     if (c == '+')      g_tok.type = T_PLUS;
     else if (c == '-') g_tok.type = T_MINUS;
+    else if (c == '*') g_tok.type = T_STAR;
+    else if (c == '/') g_tok.type = T_SLASH;
     else               g_tok.type = T_BAD;   // parser will fail exactly at this character
 }
  
 // ---------------------------------------------------------------------------
-// Parser (recursive descent). Grade 4 only needs:
-//   expr    := primary { ('+' | '-') primary }
+// Parser (recursive descent), one function per precedence level:
+//   expr    := term    { ('+' | '-') term }
+//   term    := primary { ('*' | '/') primary }
 //   primary := NUMBER
-// The loop makes + and - LEFT-associative: 10 - 3 + 1 == (10 - 3) + 1.
-// Later grades add more levels between expr and primary.
+// Precedence comes from nesting: expr calls term, so when '+' is looked at,
+// every '*' and '/' around it has already been grouped (3 + 2 * 5 == 3 + (2*5)).
+// The loops make all four operators LEFT-associative: 8 / 4 / 2 == (8/4)/2.
+//
+// Every syntax error is reported at g_tok.pos: the token the parser is looking
+// at when it cannot continue (invalid char, second operator in a row, or the
+// '\n' where an operand is missing).
 // ---------------------------------------------------------------------------
 static int parse_primary(long long *out) {
-    if (g_tok.type != T_NUM) return fail(g_tok.pos);   // error = token we are looking at
+    if (g_tok.type != T_NUM) return fail(g_tok.pos);
     *out = g_tok.value;
     advance();
     return 1;
 }
  
-static int parse_expr(long long *out) {
+static int parse_term(long long *out) {
     long long left;
     if (!parse_primary(&left)) return 0;
+    while (g_tok.type == T_STAR || g_tok.type == T_SLASH) {
+        int is_mul = (g_tok.type == T_STAR);
+        advance();
+        size_t right_pos = g_tok.pos;   // remembered: division by zero is reported HERE,
+                                        // at the start of the right operand
+        long long right;
+        if (!parse_primary(&right)) return 0;
+        if (is_mul) {
+            // Unsigned multiply: overflow wraps instead of being undefined behaviour.
+            left = (long long)((unsigned long long)left * (unsigned long long)right);
+        } else {
+            if (right == 0) return fail(right_pos);
+            // x / -1 is done as negation, because LLONG_MIN / -1 is undefined in C.
+            if (right == -1) left = (long long)(0ULL - (unsigned long long)left);
+            else             left = left / right;   // C truncates toward zero, as required
+        }
+    }
+    *out = left;
+    return 1;
+}
+ 
+static int parse_expr(long long *out) {
+    long long left;
+    if (!parse_term(&left)) return 0;
     while (g_tok.type == T_PLUS || g_tok.type == T_MINUS) {
         int plus = (g_tok.type == T_PLUS);
         advance();
         long long right;
-        if (!parse_primary(&right)) return 0;
+        if (!parse_term(&right)) return 0;
         // Unsigned arithmetic so overflow wraps instead of being undefined behaviour.
         unsigned long long x = (unsigned long long)left, y = (unsigned long long)right;
         left = (long long)(plus ? x + y : x - y);
@@ -264,4 +296,5 @@ int main(int argc, char **argv) {
     }
     return process_file(input, out_dir);
 }
+ 
  
