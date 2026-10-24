@@ -1,7 +1,7 @@
 // Asadbek Rakhmatillaev 251adb073
 // https://github.com/asadbekrakh2007-cpu/calc-lab-home
 // Compile with: gcc -O2 -Wall -Wextra -std=c17 -o calc calc.c -lm
-// Resources used: Claude (Anthropic AI assistant), conversation history: <https://claude.ai/chat/7d2a080b-8264-4c2a-acf8-d09aac79ce64>; C standard library man pages (fread, strtod, stat, mkdir, opendir)
+// Resources used: Claude (Anthropic AI assistant), conversation history: <https://claude.ai/share/556a1664-e490-4e1c-a885-34f77236f79e>; C standard library man pages (fread, strtod, stat, mkdir, opendir)
 
 // AI usage (Claude, Anthropic): I used it step by step, one grade level at a time.
 // Prompts (full history is linked in line 4):
