@@ -2,7 +2,7 @@
 // https://github.com/asadbekrakh2007-cpu/calc-lab-home
 // Compile with: gcc -O2 -Wall -Wextra -std=c17 -o calc calc.c -lm
 // Resources used: Claude (Anthropic AI assistant), conversation history: <https://claude.ai/chat/7d2a080b-8264-4c2a-acf8-d09aac79ce64>; C standard library man pages (fread, strtod, stat, mkdir, opendir)
- 
+
 // AI usage (Claude, Anthropic): I used it step by step, one grade level at a time.
 // Prompts (full history is linked in line 4):
 //   "read the lab task and tell me step by step what to do, give code with comments for each task"
