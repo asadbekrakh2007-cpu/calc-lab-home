@@ -25,7 +25,7 @@
 // A token only remembers its index in that buffer, so a position is just
 // "index + 1". Newlines are part of the buffer, so they are counted for free.
 // ---------------------------------------------------------------------------
-typedef enum { T_NUM, T_PLUS, T_MINUS, T_STAR, T_SLASH, T_EOL, T_BAD } TokType;
+typedef enum { T_NUM, T_PLUS, T_MINUS, T_STAR, T_SLASH, T_LPAREN, T_RPAREN, T_EOL, T_BAD } TokType;
  
 typedef struct {
     TokType type;
@@ -68,6 +68,8 @@ static void advance(void) {
     else if (c == '-') g_tok.type = T_MINUS;
     else if (c == '*') g_tok.type = T_STAR;
     else if (c == '/') g_tok.type = T_SLASH;
+    else if (c == '(') g_tok.type = T_LPAREN;
+    else if (c == ')') g_tok.type = T_RPAREN;
     else               g_tok.type = T_BAD;   // parser will fail exactly at this character
 }
  
@@ -75,7 +77,7 @@ static void advance(void) {
 // Parser (recursive descent), one function per precedence level:
 //   expr    := term    { ('+' | '-') term }
 //   term    := primary { ('*' | '/') primary }
-//   primary := NUMBER
+//   primary := NUMBER | '(' expr ')'
 // Precedence comes from nesting: expr calls term, so when '+' is looked at,
 // every '*' and '/' around it has already been grouped (3 + 2 * 5 == 3 + (2*5)).
 // The loops make all four operators LEFT-associative: 8 / 4 / 2 == (8/4)/2.
@@ -84,11 +86,28 @@ static void advance(void) {
 // at when it cannot continue (invalid char, second operator in a row, or the
 // '\n' where an operand is missing).
 // ---------------------------------------------------------------------------
+static int parse_expr(long long *out);   // forward declaration: primary and expr call each other
+ 
 static int parse_primary(long long *out) {
-    if (g_tok.type != T_NUM) return fail(g_tok.pos);
-    *out = g_tok.value;
-    advance();
-    return 1;
+    if (g_tok.type == T_NUM) {
+        *out = g_tok.value;
+        advance();
+        return 1;
+    }
+    if (g_tok.type == T_LPAREN) {
+        advance();
+        // The parentheses restart the grammar at the lowest level (expr), so
+        // everything inside is grouped first: (2 + 3) * 4 == 5 * 4.
+        // "()" fails inside parse_expr, at the ')' where an operand was expected.
+        if (!parse_expr(out)) return 0;
+        // A missing ')' is noticed at whatever follows the expression: for
+        // "(2 + 3" that is the '\n', so the error is reported at the end of the line.
+        if (g_tok.type != T_RPAREN) return fail(g_tok.pos);
+        advance();
+        return 1;
+    }
+    // Operator, ')', end of line or invalid character where an operand must be.
+    return fail(g_tok.pos);
 }
  
 static int parse_term(long long *out) {
@@ -131,7 +150,8 @@ static int parse_expr(long long *out) {
     return 1;
 }
  
-// Evaluates one line buf[start, end). Everything must be consumed.
+// Evaluates one line buf[start, end). Everything must be consumed: a token left
+// over after the expression (typically an extra ')') is an error at that token.
 static int eval_line(size_t start, size_t end, long long *out) {
     g_p = start;
     g_end = end;
@@ -296,5 +316,4 @@ int main(int argc, char **argv) {
     }
     return process_file(input, out_dir);
 }
- 
  
