@@ -25,7 +25,7 @@
 // A token only remembers its index in that buffer, so a position is just
 // "index + 1". Newlines are part of the buffer, so they are counted for free.
 // ---------------------------------------------------------------------------
-typedef enum { T_NUM, T_PLUS, T_MINUS, T_STAR, T_SLASH, T_LPAREN, T_RPAREN, T_EOL, T_BAD } TokType;
+typedef enum { T_NUM, T_PLUS, T_MINUS, T_STAR, T_SLASH, T_POW, T_LPAREN, T_RPAREN, T_EOL, T_BAD } TokType;
  
 typedef struct {
     TokType type;
@@ -66,7 +66,11 @@ static void advance(void) {
     g_p++;
     if (c == '+')      g_tok.type = T_PLUS;
     else if (c == '-') g_tok.type = T_MINUS;
-    else if (c == '*') g_tok.type = T_STAR;
+    else if (c == '*') {
+        // Longest match: "**" is one operator, a lone '*' is multiplication.
+        if (g_p < g_end && g_buf[g_p] == '*') { g_p++; g_tok.type = T_POW; }
+        else g_tok.type = T_STAR;
+    }
     else if (c == '/') g_tok.type = T_SLASH;
     else if (c == '(') g_tok.type = T_LPAREN;
     else if (c == ')') g_tok.type = T_RPAREN;
@@ -76,10 +80,12 @@ static void advance(void) {
 // ---------------------------------------------------------------------------
 // Parser (recursive descent), one function per precedence level:
 //   expr    := term    { ('+' | '-') term }
-//   term    := primary { ('*' | '/') primary }
+//   term    := power { ('*' | '/') power }
+//   power   := primary [ '**' power ]
 //   primary := NUMBER | '(' expr ')'
 // Precedence comes from nesting: expr calls term, so when '+' is looked at,
-// every '*' and '/' around it has already been grouped (3 + 2 * 5 == 3 + (2*5)).
+// every '*', '/' and '**' around it has already been grouped (3 + 2 * 5 == 3 + (2*5)),
+// and '**' binds tighter still because term calls power (2 * 3 ** 2 == 2 * (3**2)).
 // The loops make all four operators LEFT-associative: 8 / 4 / 2 == (8/4)/2.
 //
 // Every syntax error is reported at g_tok.pos: the token the parser is looking
@@ -110,16 +116,83 @@ static int parse_primary(long long *out) {
     return fail(g_tok.pos);
 }
  
+// Integer power by repeated squaring: O(log exp), so "1 ** 9000000000000" is
+// instant. Unsigned arithmetic avoids signed-overflow UB. result starts at 1,
+// which gives x ** 0 == 1 for every x, including 0 ** 0.
+static long long int_pow(long long base, long long exp) {
+    unsigned long long result = 1, b = (unsigned long long)base, e = (unsigned long long)exp;
+    while (e > 0) {
+        if (e & 1ULL) result *= b;
+        b *= b;
+        e >>= 1;
+    }
+    return (long long)result;
+}
+ 
+// Operands of one "**" chain are kept on this explicit stack (shared by all
+// nesting levels; each parse_power call only uses the part above its `base`).
+typedef struct {
+    long long v;
+    size_t start;   // where this operand starts (= the exponent position for the '**' before it)
+} PowItem;
+ 
+static PowItem *g_pstack;
+static size_t   g_ptop, g_pcap;
+ 
+static void pstack_push(PowItem it) {
+    if (g_ptop == g_pcap) {
+        size_t ncap = g_pcap ? g_pcap * 2 : 64;   // doubling: amortised O(1) per push
+        PowItem *t = realloc(g_pstack, ncap * sizeof *t);
+        if (!t) { fprintf(stderr, "calc: out of memory\n"); exit(1); }
+        g_pstack = t;
+        g_pcap = ncap;
+    }
+    g_pstack[g_ptop++] = it;
+}
+ 
+// ** is RIGHT-associative: 2 ** 3 ** 2 must be 2 ** (3 ** 2) == 512. The
+// textbook rule `power := primary ['**' power]` gets this by recursing on the
+// right side (power calls itself for the exponent). We give the same grouping
+// iteratively: collect all operands of the chain, then fold from the right.
+// Reason: a line like "1 ** 1 ** 1 ** ..." with thousands of terms would
+// otherwise recurse that deep and could overflow the C stack, while the task
+// only promises deep nesting for parentheses.
+// All operands are parsed before any power is computed, so a syntax error later
+// in the line is reported before an arithmetic error earlier in it.
+static int parse_power(long long *out) {
+    size_t base = g_ptop;
+    for (;;) {
+        PowItem it;
+        it.start = g_tok.pos;
+        if (!parse_primary(&it.v)) { g_ptop = base; return 0; }
+        pstack_push(it);
+        if (g_tok.type != T_POW) break;
+        advance();   // consume '**'
+    }
+    long long acc = g_pstack[g_ptop - 1].v;   // right-most operand
+    for (size_t i = g_ptop - 1; i > base; i--) {
+        // A negative integer exponent is reported at the START OF THE EXPONENT:
+        // that operand is what makes the power impossible with integers.
+        if (acc < 0) { g_ptop = base; return fail(g_pstack[i].start); }
+        acc = int_pow(g_pstack[i - 1].v, acc);
+    }
+    g_ptop = base;
+    *out = acc;
+    return 1;
+}
+ 
+static int parse_power(long long *out);
+ 
 static int parse_term(long long *out) {
     long long left;
-    if (!parse_primary(&left)) return 0;
+    if (!parse_power(&left)) return 0;
     while (g_tok.type == T_STAR || g_tok.type == T_SLASH) {
         int is_mul = (g_tok.type == T_STAR);
         advance();
         size_t right_pos = g_tok.pos;   // remembered: division by zero is reported HERE,
                                         // at the start of the right operand
         long long right;
-        if (!parse_primary(&right)) return 0;
+        if (!parse_power(&right)) return 0;
         if (is_mul) {
             // Unsigned multiply: overflow wraps instead of being undefined behaviour.
             left = (long long)((unsigned long long)left * (unsigned long long)right);
@@ -155,6 +228,7 @@ static int parse_expr(long long *out) {
 static int eval_line(size_t start, size_t end, long long *out) {
     g_p = start;
     g_end = end;
+    g_ptop = 0;   // a failed line may have left operands on the power stack
     advance();
     if (!parse_expr(out)) return 0;
     if (g_tok.type != T_EOL) return fail(g_tok.pos);
@@ -193,7 +267,11 @@ static int evaluate(char *buf, size_t len, OutBuf *out) {
         size_t j = i;
         while (j < le && (buf[j] == ' ' || buf[j] == '\t')) j++;
  
-        if (j < le) {   // blank lines (only spaces/tabs) produce no output
+        // A blank line (only spaces/tabs) produces no output. A line whose FIRST
+        // non-blank character is '#' is a comment and is skipped. We only skip by
+        // index, so the comment's characters (and its '\n') still count for
+        // positions. A '#' anywhere else reaches the lexer as an invalid character.
+        if (j < le && buf[j] != '#') {
             long long v;
             if (!eval_line(j, le, &v)) return 0;
             char tmp[64];
@@ -314,6 +392,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: calc -o OUTDIR input.txt\n");
         return 2;
     }
-    return process_file(input, out_dir);
+    int rc = process_file(input, out_dir);
+    free(g_pstack);   // no leaks, so the sanitizer build stays quiet
+    return rc;
 }
  
