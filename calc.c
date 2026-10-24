@@ -1,9 +1,15 @@
 // Asadbek Rakhmatillaev 251adb073
 // https://github.com/asadbekrakh2007-cpu/calc-lab-home
 // Compile with: gcc -O2 -Wall -Wextra -std=c17 -o calc calc.c -lm
-// Resources used: Claude (Anthropic AI assistant), conversation history: <PASTE SHARE LINK HERE>; C standard library man pages (fread, stat, mkdir)
+// Resources used: Claude (Anthropic AI assistant), conversation history: <PASTE SHARE LINK HERE>; C standard library man pages (fread, strtod, stat, mkdir, opendir)
  
-// Makes mkdir/stat visible even under strict -std=c17 (which hides POSIX names).
+// AI usage (Claude, Anthropic): I used it step by step, one grade level at a time.
+// Prompts (full history is linked in line 4):
+//   "read the lab task and tell me step by step what to do, give code with comments for each task"
+//   "give ready code for task 1 (grade 4), then task 2, ... up to grade 10"
+// I tested every step with my own tests in mytests/ and with calc-tests, and I can explain the code.
+ 
+// Exposes mkdir/stat/opendir declarations even under -std=c17 (strict ISO mode hides POSIX names).
 #define _POSIX_C_SOURCE 200809L
  
 #include <ctype.h>
@@ -15,111 +21,179 @@
 #include <string.h>
 #include <sys/stat.h>
  
-// Used in output file names, lowercase (e.g. task1_anna_berzina_221234.txt).
-// CHANGE THESE THREE LINES.
+// ---------------------------------------------------------------------------
+// Student identity. Used for output file / folder names (lowercase, as in the
+// task examples: task1_anna_berzina_221234.txt).
+// ---------------------------------------------------------------------------
 #define STUDENT_NAME     "asadbek"
 #define STUDENT_LASTNAME "rakhmatillaev"
 #define STUDENT_ID       "251adb073"
  
 // ---------------------------------------------------------------------------
-// Tokenizer. The whole file lives in ONE buffer (g_buf) and is never copied.
-// A token only remembers its index in that buffer, so a position is just
-// "index + 1". Newlines are part of the buffer, so they are counted for free.
+// Values: a number is either an integer or a double. We keep a flag instead of
+// always using double so that 64-bit integers stay exact (a double only has
+// 53 bits of mantissa) and so that "7 / 2" can truncate like C.
 // ---------------------------------------------------------------------------
-typedef enum { T_NUM, T_PLUS, T_MINUS, T_STAR, T_SLASH, T_POW, T_LPAREN, T_RPAREN, T_EOL, T_BAD } TokType;
+typedef struct {
+    int is_float;     // 0 = integer arithmetic, 1 = double arithmetic
+    long long i;      // valid when is_float == 0
+    double d;         // valid when is_float == 1
+} Value;
+ 
+static Value make_int(long long x)  { Value v; v.is_float = 0; v.i = x; v.d = 0.0; return v; }
+static Value make_flt(double x)     { Value v; v.is_float = 1; v.i = 0; v.d = x;   return v; }
+static double as_double(Value v)    { return v.is_float ? v.d : (double)v.i; }
+ 
+// ---------------------------------------------------------------------------
+// Tokenizer state.
+// The whole input file is read into ONE buffer (g_buf) and never copied again.
+// Tokens only remember an index into that buffer, so a position is simply
+// "index in the file + 1". Because every character of the file (newlines and
+// comment lines included) has an index, positions are automatically correct
+// without separate line/column counters.
+// ---------------------------------------------------------------------------
+typedef enum {
+    T_NUM, T_PLUS, T_MINUS, T_STAR, T_SLASH, T_POW,
+    T_LPAREN, T_RPAREN,
+    T_EOL,   // end of the current line (pos = index of its '\n', or file length)
+    T_BAD    // a character that cannot start any token
+} TokType;
  
 typedef struct {
     TokType type;
-    size_t pos;       // 0-based index of the token's first character in the file
-    long long value;  // only for T_NUM
+    size_t pos;   // 0-based index of the token's first character in the file
+    Value val;    // only for T_NUM
 } Token;
  
-static char  *g_buf;      // the whole input file
+static char  *g_buf;      // whole file, NUL-terminated (the NUL is needed by strtod trick below)
 static size_t g_p;        // lexer cursor
 static size_t g_end;      // end index (exclusive) of the line being parsed
-static Token  g_tok;      // the token the parser is currently looking at
-static size_t g_err_pos;  // 0-based position of the first error
+static Token  g_tok;      // the one token of lookahead the parser is "looking at"
+static size_t g_err_pos;  // 0-based position of the first error found
  
-// Remember an error position and return 0, so callers can `return fail(...)`.
+// Records an error at `pos` and returns 0 so callers can write `return fail(...)`.
+// We use return codes instead of setjmp/longjmp because setjmp.h is not in the
+// list of allowed headers.
 static int fail(size_t pos) {
     g_err_pos = pos;
     return 0;
 }
  
-// Produces the next token on demand (one at a time, no token array).
+// AI (Claude): prompt "how to call strtod on a number inside a big buffer without copying it".
+//   I used the idea of temporarily writing a NUL after the number (see below).
+// Reads a number starting at g_p. Integers are accumulated by hand (no strtoll)
+// so that a number is consumed exactly up to its last digit. A '.' is only part
+// of the number when digits follow it: for "5." or ".5" the '.' is left behind
+// and becomes a T_BAD token, which puts the error exactly at the '.', as the
+// rules demand. The same happens for the 'e' in "1.5e3".
+static void lex_number(void) {
+    size_t start = g_p;
+    unsigned long long acc = 0;  // unsigned: wrap-around is defined, signed overflow is UB
+    while (g_p < g_end && isdigit((unsigned char)g_buf[g_p])) {
+        acc = acc * 10ULL + (unsigned long long)(g_buf[g_p] - '0');
+        g_p++;
+    }
+    g_tok.type = T_NUM;
+    if (g_p + 1 < g_end && g_buf[g_p] == '.' && isdigit((unsigned char)g_buf[g_p + 1])) {
+        g_p++;
+        while (g_p < g_end && isdigit((unsigned char)g_buf[g_p])) g_p++;
+        // strtod needs a NUL-terminated string. Instead of copying the number to a
+        // scratch buffer, we temporarily put a NUL right after it (the buffer is
+        // ours and has room for it) and restore the character: no allocation, no copy.
+        char saved = g_buf[g_p];
+        g_buf[g_p] = '\0';
+        double d = strtod(g_buf + start, NULL);
+        g_buf[g_p] = saved;
+        g_tok.val = make_flt(d);
+    } else {
+        g_tok.val = make_int((long long)acc);
+    }
+}
+ 
+// Produces the next token into g_tok. Tokens are produced on demand (one at a
+// time) so memory use does not grow with the line length.
 static void advance(void) {
     while (g_p < g_end && (g_buf[g_p] == ' ' || g_buf[g_p] == '\t')) g_p++;
     g_tok.pos = g_p;
     if (g_p >= g_end) { g_tok.type = T_EOL; return; }
  
     char c = g_buf[g_p];
-    if (isdigit((unsigned char)c)) {
-        // Unsigned accumulation: wrap-around is defined, signed overflow is not.
-        unsigned long long acc = 0;
-        while (g_p < g_end && isdigit((unsigned char)g_buf[g_p])) {
-            acc = acc * 10ULL + (unsigned long long)(g_buf[g_p] - '0');
-            g_p++;
-        }
-        g_tok.type = T_NUM;
-        g_tok.value = (long long)acc;
-        return;
+    if (isdigit((unsigned char)c)) { lex_number(); return; }
+ 
+    g_p++;  // every remaining token consumes at least this one character
+    switch (c) {
+        case '+': g_tok.type = T_PLUS;   break;
+        case '-': g_tok.type = T_MINUS;  break;
+        case '/': g_tok.type = T_SLASH;  break;
+        case '(': g_tok.type = T_LPAREN; break;
+        case ')': g_tok.type = T_RPAREN; break;
+        case '*':
+            // Longest match: "**" is one operator, a lone '*' is multiplication.
+            if (g_p < g_end && g_buf[g_p] == '*') { g_p++; g_tok.type = T_POW; }
+            else g_tok.type = T_STAR;
+            break;
+        // Anything else ('#' not at line start, letters, '&', '\r', ...) is invalid.
+        // The parser will fail on it at g_tok.pos, i.e. at that very character.
+        default:  g_tok.type = T_BAD;    break;
     }
-    g_p++;
-    if (c == '+')      g_tok.type = T_PLUS;
-    else if (c == '-') g_tok.type = T_MINUS;
-    else if (c == '*') {
-        // Longest match: "**" is one operator, a lone '*' is multiplication.
-        if (g_p < g_end && g_buf[g_p] == '*') { g_p++; g_tok.type = T_POW; }
-        else g_tok.type = T_STAR;
-    }
-    else if (c == '/') g_tok.type = T_SLASH;
-    else if (c == '(') g_tok.type = T_LPAREN;
-    else if (c == ')') g_tok.type = T_RPAREN;
-    else               g_tok.type = T_BAD;   // parser will fail exactly at this character
 }
  
 // ---------------------------------------------------------------------------
-// Parser (recursive descent), one function per precedence level:
-//   expr    := term    { ('+' | '-') term }
-//   term    := power { ('*' | '/') power }
-//   power   := primary [ '**' power ]
-//   primary := NUMBER | '(' expr ')'
-// Precedence comes from nesting: expr calls term, so when '+' is looked at,
-// every '*', '/' and '**' around it has already been grouped (3 + 2 * 5 == 3 + (2*5)),
-// and '**' binds tighter still because term calls power (2 * 3 ** 2 == 2 * (3**2)).
-// The loops make all four operators LEFT-associative: 8 / 4 / 2 == (8/4)/2.
+// Arithmetic. Integer vs float decision: the result is an integer only if
+// BOTH operands are integers; as soon as one is a float, both are converted to
+// double. That is the rule from the task and it is checked in one place per op.
 //
-// Every syntax error is reported at g_tok.pos: the token the parser is looking
-// at when it cannot continue (invalid char, second operator in a row, or the
-// '\n' where an operand is missing).
+// Integer + - * use unsigned arithmetic and convert back, so overflow wraps
+// instead of being undefined behaviour (the sanitizer build would complain).
+// Float results are checked with isfinite(): inf/NaN is an error reported at
+// the operator, because the operator is what "produced" the bad value.
 // ---------------------------------------------------------------------------
-static int parse_expr(long long *out);   // forward declaration: primary and expr call each other
- 
-static int parse_primary(long long *out) {
-    if (g_tok.type == T_NUM) {
-        *out = g_tok.value;
-        advance();
+static int apply_addsub(char op, Value a, Value b, size_t op_pos, Value *res) {
+    if (!a.is_float && !b.is_float) {
+        unsigned long long x = (unsigned long long)a.i, y = (unsigned long long)b.i;
+        *res = make_int((long long)(op == '+' ? x + y : x - y));
         return 1;
     }
-    if (g_tok.type == T_LPAREN) {
-        advance();
-        // The parentheses restart the grammar at the lowest level (expr), so
-        // everything inside is grouped first: (2 + 3) * 4 == 5 * 4.
-        // "()" fails inside parse_expr, at the ')' where an operand was expected.
-        if (!parse_expr(out)) return 0;
-        // A missing ')' is noticed at whatever follows the expression: for
-        // "(2 + 3" that is the '\n', so the error is reported at the end of the line.
-        if (g_tok.type != T_RPAREN) return fail(g_tok.pos);
-        advance();
-        return 1;
-    }
-    // Operator, ')', end of line or invalid character where an operand must be.
-    return fail(g_tok.pos);
+    double x = as_double(a), y = as_double(b);
+    double r = (op == '+') ? x + y : x - y;
+    if (!isfinite(r)) return fail(op_pos);
+    *res = make_flt(r);
+    return 1;
 }
  
-// Integer power by repeated squaring: O(log exp), so "1 ** 9000000000000" is
-// instant. Unsigned arithmetic avoids signed-overflow UB. result starts at 1,
-// which gives x ** 0 == 1 for every x, including 0 ** 0.
+static int apply_mul(Value a, Value b, size_t op_pos, Value *res) {
+    if (!a.is_float && !b.is_float) {
+        *res = make_int((long long)((unsigned long long)a.i * (unsigned long long)b.i));
+        return 1;
+    }
+    double r = as_double(a) * as_double(b);
+    if (!isfinite(r)) return fail(op_pos);
+    *res = make_flt(r);
+    return 1;
+}
+ 
+// Division by zero is reported at the START OF THE RIGHT OPERAND (r_pos): that
+// is the token that makes the division impossible. Non-finite float results
+// (e.g. overflow) are reported at the operator like other float errors.
+static int apply_div(Value a, Value b, size_t op_pos, size_t r_pos, Value *res) {
+    if (!a.is_float && !b.is_float) {
+        if (b.i == 0) return fail(r_pos);
+        // x / -1 is computed as negation: LLONG_MIN / -1 would be undefined in C.
+        if (b.i == -1) *res = make_int((long long)(0ULL - (unsigned long long)a.i));
+        else           *res = make_int(a.i / b.i);   // C truncates toward zero, as required
+        return 1;
+    }
+    double y = as_double(b);
+    if (y == 0.0) return fail(r_pos);     // float division by zero is also an error
+    double r = as_double(a) / y;
+    if (!isfinite(r)) return fail(op_pos);
+    *res = make_flt(r);
+    return 1;
+}
+ 
+// Integer power by repeated squaring: O(log exp), so "1 ** 9000000000000"
+// is instant. Unsigned arithmetic again avoids signed-overflow UB.
+// result starts at 1, which also gives x ** 0 == 1 and 0 ** 0 == 1.
 static long long int_pow(long long base, long long exp) {
     unsigned long long result = 1, b = (unsigned long long)base, e = (unsigned long long)exp;
     while (e > 0) {
@@ -130,11 +204,44 @@ static long long int_pow(long long base, long long exp) {
     return (long long)result;
 }
  
-// Operands of one "**" chain are kept on this explicit stack (shared by all
-// nesting levels; each parse_power call only uses the part above its `base`).
+// A negative integer exponent is reported at the start of the exponent (e_pos).
+// With a float operand we use pow(), where negative exponents are fine
+// (0.5 ** (0-1) == 2); NaN/inf (e.g. (0-8) ** 0.5) is reported at the operator.
+static int apply_pow(Value a, Value b, size_t op_pos, size_t e_pos, Value *res) {
+    if (!a.is_float && !b.is_float) {
+        if (b.i < 0) return fail(e_pos);
+        *res = make_int(int_pow(a.i, b.i));
+        return 1;
+    }
+    double r = pow(as_double(a), as_double(b));
+    if (!isfinite(r)) return fail(op_pos);
+    *res = make_flt(r);
+    return 1;
+}
+ 
+// ---------------------------------------------------------------------------
+// Parser: recursive descent, one function per precedence level.
+//
+//   expr    := term  { ('+' | '-') term }
+//   term    := power { ('*' | '/') power }
+//   power   := primary [ '**' power ]
+//   primary := NUMBER | '(' expr ')'
+//
+// Precedence comes from nesting: expr calls term, term calls power, so by the
+// time '+' is looked at, every '*' and '**' to its sides has already been
+// grouped. Loops in expr/term give LEFT associativity (a - b - c == (a-b)-c).
+//
+// Error position rule: every syntax error is reported at g_tok.pos, the token
+// the parser is looking at when it cannot continue (invalid char, second
+// operator in a row, missing operand/')' at '\n', extra ')').
+// ---------------------------------------------------------------------------
+static int parse_expr(Value *out);
+ 
+// Explicit stack for the operands of a "**" chain. See parse_power for why.
 typedef struct {
-    long long v;
-    size_t start;   // where this operand starts (= the exponent position for the '**' before it)
+    Value v;
+    size_t start;   // where this operand starts (the exponent position for the previous '**')
+    size_t op_pos;  // position of the '**' that FOLLOWS this operand
 } PowItem;
  
 static PowItem *g_pstack;
@@ -151,85 +258,99 @@ static void pstack_push(PowItem it) {
     g_pstack[g_ptop++] = it;
 }
  
-// ** is RIGHT-associative: 2 ** 3 ** 2 must be 2 ** (3 ** 2) == 512. The
-// textbook rule `power := primary ['**' power]` gets this by recursing on the
-// right side (power calls itself for the exponent). We give the same grouping
-// iteratively: collect all operands of the chain, then fold from the right.
-// Reason: a line like "1 ** 1 ** 1 ** ..." with thousands of terms would
-// otherwise recurse that deep and could overflow the C stack, while the task
-// only promises deep nesting for parentheses.
-// All operands are parsed before any power is computed, so a syntax error later
-// in the line is reported before an arithmetic error earlier in it.
-static int parse_power(long long *out) {
-    size_t base = g_ptop;
+static int parse_primary(Value *out) {
+    if (g_tok.type == T_NUM) {
+        *out = g_tok.val;
+        advance();
+        return 1;
+    }
+    if (g_tok.type == T_LPAREN) {
+        advance();
+        if (!parse_expr(out)) return 0;
+        // A missing ')' is noticed at whatever follows: at '\n' for "(2 + 3",
+        // which is why that error is reported at the end of the line.
+        if (g_tok.type != T_RPAREN) return fail(g_tok.pos);
+        advance();
+        return 1;
+    }
+    // Operator, ')', end of line or invalid char where an operand must be.
+    return fail(g_tok.pos);
+}
+ 
+// AI (Claude): prompt "make ** right-associative without deep recursion for very long chains".
+//   I used the idea of an explicit operand stack folded from the right.
+// ** is right-associative: 2 ** 3 ** 2 must be 2 ** (3 ** 2). The textbook way
+// is `power := primary ['**' power]`, i.e. recursion on the right side. We do
+// the same grouping but iteratively: collect operands of the whole chain, then
+// fold from the right. Reason: a test line like "1 ** 1 ** 1 ** ..." thousands
+// of terms long would otherwise recurse thousands of levels deep and could
+// overflow the C stack, while the task only promises depth for parentheses.
+// All operands are parsed before any power is evaluated, so a syntax error
+// later in the chain is reported before an evaluation error earlier in it,
+// exactly as the recursive version would do.
+static int parse_power(Value *out) {
+    size_t base = g_ptop;   // our chain lives above whatever outer calls pushed
     for (;;) {
         PowItem it;
         it.start = g_tok.pos;
+        it.op_pos = 0;
         if (!parse_primary(&it.v)) { g_ptop = base; return 0; }
-        pstack_push(it);
-        if (g_tok.type != T_POW) break;
-        advance();   // consume '**'
+        int more = (g_tok.type == T_POW);
+        if (more) it.op_pos = g_tok.pos;
+        pstack_push(it);   // nested parse_primary calls finished before this push, so indices stay valid
+        if (!more) break;
+        advance();         // consume '**'
     }
-    long long acc = g_pstack[g_ptop - 1].v;   // right-most operand
+    Value acc = g_pstack[g_ptop - 1].v;       // right-most operand
     for (size_t i = g_ptop - 1; i > base; i--) {
-        // A negative integer exponent is reported at the START OF THE EXPONENT:
-        // that operand is what makes the power impossible with integers.
-        if (acc < 0) { g_ptop = base; return fail(g_pstack[i].start); }
-        acc = int_pow(g_pstack[i - 1].v, acc);
+        PowItem left = g_pstack[i - 1];
+        // exponent starts where operand i starts; the operator is the one after operand i-1
+        if (!apply_pow(left.v, acc, left.op_pos, g_pstack[i].start, &acc)) { g_ptop = base; return 0; }
     }
     g_ptop = base;
     *out = acc;
     return 1;
 }
  
-static int parse_power(long long *out);
- 
-static int parse_term(long long *out) {
-    long long left;
+static int parse_term(Value *out) {
+    Value left;
     if (!parse_power(&left)) return 0;
     while (g_tok.type == T_STAR || g_tok.type == T_SLASH) {
-        int is_mul = (g_tok.type == T_STAR);
+        char op = (g_tok.type == T_STAR) ? '*' : '/';
+        size_t op_pos = g_tok.pos;
         advance();
-        size_t right_pos = g_tok.pos;   // remembered: division by zero is reported HERE,
-                                        // at the start of the right operand
-        long long right;
+        size_t r_pos = g_tok.pos;   // remembered for the division-by-zero position
+        Value right;
         if (!parse_power(&right)) return 0;
-        if (is_mul) {
-            // Unsigned multiply: overflow wraps instead of being undefined behaviour.
-            left = (long long)((unsigned long long)left * (unsigned long long)right);
-        } else {
-            if (right == 0) return fail(right_pos);
-            // x / -1 is done as negation, because LLONG_MIN / -1 is undefined in C.
-            if (right == -1) left = (long long)(0ULL - (unsigned long long)left);
-            else             left = left / right;   // C truncates toward zero, as required
-        }
+        int ok = (op == '*') ? apply_mul(left, right, op_pos, &left)
+                             : apply_div(left, right, op_pos, r_pos, &left);
+        if (!ok) return 0;
     }
     *out = left;
     return 1;
 }
  
-static int parse_expr(long long *out) {
-    long long left;
+static int parse_expr(Value *out) {
+    Value left;
     if (!parse_term(&left)) return 0;
     while (g_tok.type == T_PLUS || g_tok.type == T_MINUS) {
-        int plus = (g_tok.type == T_PLUS);
+        char op = (g_tok.type == T_PLUS) ? '+' : '-';
+        size_t op_pos = g_tok.pos;
         advance();
-        long long right;
+        Value right;
         if (!parse_term(&right)) return 0;
-        // Unsigned arithmetic so overflow wraps instead of being undefined behaviour.
-        unsigned long long x = (unsigned long long)left, y = (unsigned long long)right;
-        left = (long long)(plus ? x + y : x - y);
+        if (!apply_addsub(op, left, right, op_pos, &left)) return 0;
     }
     *out = left;
     return 1;
 }
  
-// Evaluates one line buf[start, end). Everything must be consumed: a token left
-// over after the expression (typically an extra ')') is an error at that token.
-static int eval_line(size_t start, size_t end, long long *out) {
+// Evaluates the line buf[start, end). The whole line must be consumed: a token
+// left over after the expression (typically an extra ')') is an error at that token.
+static int eval_line(size_t start, size_t end, Value *out) {
     g_p = start;
     g_end = end;
-    g_ptop = 0;   // a failed line may have left operands on the power stack
+    g_ptop = 0;
     advance();
     if (!parse_expr(out)) return 0;
     if (g_tok.type != T_EOL) return fail(g_tok.pos);
@@ -237,9 +358,10 @@ static int eval_line(size_t start, size_t end, long long *out) {
 }
  
 // ---------------------------------------------------------------------------
-// Output buffer. Results are kept in memory and written once at the end,
-// because if any line fails the file must contain ONLY the error.
-// Doubling growth keeps total copying linear.
+// Output buffer. Results are collected in memory and written once at the end,
+// because "if any error occurs, the file contains ONLY the error" - we cannot
+// know that until the last line has been checked. Doubling growth keeps the
+// total copying work linear in the output size.
 // ---------------------------------------------------------------------------
 typedef struct { char *data; size_t len, cap; } OutBuf;
  
@@ -256,27 +378,28 @@ static void ob_append(OutBuf *o, const char *s, size_t n) {
     o->len += n;
 }
  
-// Walks the file line by line IN PLACE (memchr finds each '\n'; no per-line copy).
-// Lines are processed in order, so the first failure is the first error.
+// Walks the file line by line IN PLACE (no per-line copies; memchr finds the
+// '\n'). Returns 1 and fills `out` if every line is fine, otherwise returns 0
+// with g_err_pos set to the first error (lines are processed in order, so the
+// first failure is the first error in the file).
 static int evaluate(char *buf, size_t len, OutBuf *out) {
     g_buf = buf;
     size_t i = 0;
     while (i < len) {
         const char *nl = memchr(buf + i, '\n', len - i);
-        size_t le = nl ? (size_t)(nl - buf) : len;   // index of '\n' (or file length)
+        size_t le = nl ? (size_t)(nl - buf) : len;   // le = index of '\n' (or file length)
  
         size_t j = i;
         while (j < le && (buf[j] == ' ' || buf[j] == '\t')) j++;
  
-        // A blank line (only spaces/tabs) produces no output. A line whose FIRST
-        // non-blank character is '#' is a comment and is skipped. We only skip by
-        // index, so the comment's characters (and its '\n') still count for
-        // positions. A '#' anywhere else reaches the lexer as an invalid character.
+        // Blank line -> no output. First non-blank '#' -> comment line, ignored
+        // (its characters still count for positions because we only skip by index).
         if (j < le && buf[j] != '#') {
-            long long v;
+            Value v;
             if (!eval_line(j, le, &v)) return 0;
             char tmp[64];
-            int n = snprintf(tmp, sizeof tmp, "%lld\n", v);
+            int n = v.is_float ? snprintf(tmp, sizeof tmp, "%.15g\n", v.d)
+                               : snprintf(tmp, sizeof tmp, "%lld\n", v.i);
             ob_append(out, tmp, (size_t)n);
         }
         i = le + 1;
@@ -285,11 +408,15 @@ static int evaluate(char *buf, size_t len, OutBuf *out) {
 }
  
 // ---------------------------------------------------------------------------
-// Files
+// File and path helpers
 // ---------------------------------------------------------------------------
  
-// Reads the whole file into one buffer. Size is unknown in advance, so the
-// buffer doubles when full: every byte is copied O(1) times on average.
+// AI (Claude): prompt "how do I read a whole file into memory in C without knowing its size".
+//   I used the realloc doubling idea; the loop below is written/checked by me.
+// Reads a whole file into one heap buffer. The size is not known in advance
+// (works for any file type), so the buffer doubles when full: each byte is
+// copied O(1) times on average instead of re-reading or re-copying per line.
+// One extra byte is kept for the terminating NUL used by lex_number.
 static char *read_file(const char *path, size_t *out_len) {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
@@ -307,7 +434,7 @@ static char *read_file(const char *path, size_t *out_len) {
             buf = t;
         }
     }
-    if (ferror(f)) { free(buf); fclose(f); return NULL; }
+    if (ferror(f)) { free(buf); fclose(f); return NULL; }   // e.g. a folder was given as a file
     fclose(f);
     buf[len] = '\0';
     *out_len = len;
@@ -470,4 +597,3 @@ int main(int argc, char **argv) {
     free(g_pstack);   // no leaks, so the AddressSanitizer build stays quiet
     return rc;
 }
- 
