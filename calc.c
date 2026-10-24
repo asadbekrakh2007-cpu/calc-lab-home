@@ -7,6 +7,7 @@
 #define _POSIX_C_SOURCE 200809L
  
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <math.h>
 #include <stdio.h>
@@ -313,12 +314,15 @@ static char *read_file(const char *path, size_t *out_len) {
     return buf;
 }
  
-// Returns a malloc'ed copy of the file name without folders and without ".txt".
-static char *base_name(const char *path) {
-    size_t n = strlen(path), s = n;
+// Returns a malloc'ed copy of the last path component. Trailing '/' are ignored
+// ("labs/" -> "labs"). With strip_txt, a final ".txt" is removed ("task1.txt" -> "task1").
+static char *base_name(const char *path, int strip_txt) {
+    size_t n = strlen(path);
+    while (n > 1 && path[n - 1] == '/') n--;
+    size_t s = n;
     while (s > 0 && path[s - 1] != '/') s--;
     size_t m = n - s;
-    if (m > 4 && memcmp(path + s + m - 4, ".txt", 4) == 0) m -= 4;
+    if (strip_txt && m > 4 && memcmp(path + s + m - 4, ".txt", 4) == 0) m -= 4;
     char *r = malloc(m + 1);
     if (!r) { fprintf(stderr, "calc: out of memory\n"); exit(1); }
     memcpy(r, path + s, m);
@@ -326,7 +330,8 @@ static char *base_name(const char *path) {
     return r;
 }
  
-// Creates the folder if missing (its parent exists); an existing one is reused.
+// Creates `path` if missing (its parent is guaranteed to exist by the task).
+// If it already exists we just write into it.
 static int ensure_dir(const char *path) {
     struct stat st;
     if (stat(path, &st) == 0) {
@@ -341,7 +346,9 @@ static int ensure_dir(const char *path) {
     return 0;
 }
  
-// Evaluates one file and writes <out_dir>/<base>_<name>_<lastname>_<id>.txt
+// Evaluates one input file and writes <out_dir>/<base>_<name>_<lastname>_<id>.txt.
+// Returns 0 on success (including an ERROR:<pos> result, which is a normal
+// outcome), 1 if the file cannot be read or the output cannot be written.
 static int process_file(const char *in_path, const char *out_dir) {
     size_t len = 0;
     char *buf = read_file(in_path, &len);
@@ -352,15 +359,16 @@ static int process_file(const char *in_path, const char *out_dir) {
  
     OutBuf out = { NULL, 0, 0 };
     if (!evaluate(buf, len, &out)) {
-        out.len = 0;   // no partial results: keep only the error
+        // No partial results: throw away what was collected, keep only the error.
+        out.len = 0;
         char tmp[64];
-        int n = snprintf(tmp, sizeof tmp, "ERROR:%zu\n", g_err_pos + 1);   // positions are 1-based
+        int n = snprintf(tmp, sizeof tmp, "ERROR:%zu\n", g_err_pos + 1);   // +1: positions are 1-based
         ob_append(&out, tmp, (size_t)n);
     }
     free(buf);
  
     int rc = 1;
-    char *base = base_name(in_path);
+    char *base = base_name(in_path, 1);
     size_t plen = strlen(out_dir) + strlen(base) + sizeof STUDENT_NAME + sizeof STUDENT_LASTNAME + sizeof STUDENT_ID + 16;
     char *out_path = malloc(plen);
     if (!out_path) { fprintf(stderr, "calc: out of memory\n"); exit(1); }
@@ -371,7 +379,7 @@ static int process_file(const char *in_path, const char *out_dir) {
         if (!f) {
             fprintf(stderr, "calc: cannot write '%s': %s\n", out_path, strerror(errno));
         } else {
-            // fwrite with a NULL pointer is undefined even for 0 bytes (empty output).
+            // fwrite with a NULL pointer is undefined even for 0 bytes; an all-comment file has no output.
             size_t w = out.len ? fwrite(out.data, 1, out.len, f) : 0;
             int cl = fclose(f);
             if (w != out.len || cl != 0) fprintf(stderr, "calc: error while writing '%s'\n", out_path);
@@ -384,16 +392,82 @@ static int process_file(const char *in_path, const char *out_dir) {
     return rc;
 }
  
-// Grade 4 command line: calc -o OUTDIR input.txt  (full CLI comes in grade 9)
-int main(int argc, char **argv) {
-    const char *out_dir = argc == 4 ? argv[2] : NULL;
-    const char *input   = argc == 4 ? argv[3] : NULL;
-    if (!out_dir || !input || strcmp(argv[1], "-o") != 0) {
-        fprintf(stderr, "usage: calc -o OUTDIR input.txt\n");
-        return 2;
+static int usage(const char *msg) {
+    fprintf(stderr, "calc: %s\n", msg);
+    fprintf(stderr, "usage: calc [-d DIR | --dir DIR] [-o OUTDIR | --output-dir OUTDIR] [input.txt]\n");
+    return 2;
+}
+ 
+// Evaluates every regular *.txt file directly inside `dir` (no recursion).
+static int process_dir(const char *dir, const char *out_dir) {
+    DIR *d = opendir(dir);
+    if (!d) {
+        fprintf(stderr, "calc: cannot open folder '%s': %s\n", dir, strerror(errno));
+        return 1;
     }
-    int rc = process_file(input, out_dir);
-    free(g_pstack);   // no leaks, so the sanitizer build stays quiet
+    if (ensure_dir(out_dir) != 0) { closedir(d); return 1; }
+ 
+    int rc = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        size_t nl = strlen(e->d_name);
+        if (nl <= 4 || strcmp(e->d_name + nl - 4, ".txt") != 0) continue;
+ 
+        size_t plen = strlen(dir) + nl + 2;
+        char *path = malloc(plen);
+        if (!path) { fprintf(stderr, "calc: out of memory\n"); exit(1); }
+        snprintf(path, plen, "%s/%s", dir, e->d_name);
+ 
+        // stat instead of d_type: d_type is not available in strict -std=c17 mode.
+        // A subfolder named "x.txt" must be ignored, so we require a regular file.
+        struct stat st;
+        if (stat(path, &st) == 0 && S_ISREG(st.st_mode)) {
+            if (process_file(path, out_dir) != 0) rc = 1;   // keep going, but remember the failure
+        }
+        free(path);
+    }
+    closedir(d);
+    return rc;
+}
+ 
+int main(int argc, char **argv) {
+    const char *dir = NULL, *out_dir = NULL, *input = NULL;
+ 
+    for (int a = 1; a < argc; a++) {
+        const char *s = argv[a];
+        if (strcmp(s, "-d") == 0 || strcmp(s, "--dir") == 0) {
+            if (++a >= argc) return usage("option needs a value: -d DIR");
+            dir = argv[a];
+        } else if (strcmp(s, "-o") == 0 || strcmp(s, "--output-dir") == 0) {
+            if (++a >= argc) return usage("option needs a value: -o OUTDIR");
+            out_dir = argv[a];
+        } else if (s[0] == '-' && s[1] != '\0') {
+            fprintf(stderr, "calc: unknown option '%s'\n", s);
+            return usage("unknown option");
+        } else {
+            if (input) return usage("only one input file is allowed");
+            input = s;
+        }
+    }
+    if (!dir && !input) return usage("no input file or folder given");
+    if (dir && input)   return usage("give either an input file or -d DIR, not both");
+ 
+    // Default output folder: <input_base>_<name>_<studentid> in the current folder.
+    char *default_out = NULL;
+    if (!out_dir) {
+        char *base = base_name(dir ? dir : input, dir ? 0 : 1);
+        size_t n = strlen(base) + sizeof STUDENT_NAME + sizeof STUDENT_ID + 4;
+        default_out = malloc(n);
+        if (!default_out) { fprintf(stderr, "calc: out of memory\n"); exit(1); }
+        snprintf(default_out, n, "%s_%s_%s", base, STUDENT_NAME, STUDENT_ID);
+        free(base);
+        out_dir = default_out;
+    }
+ 
+    int rc = dir ? process_dir(dir, out_dir) : process_file(input, out_dir);
+ 
+    free(default_out);
+    free(g_pstack);   // no leaks, so the AddressSanitizer build stays quiet
     return rc;
 }
  
